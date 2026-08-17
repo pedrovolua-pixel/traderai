@@ -1,0 +1,384 @@
+//@version=6
+indicator("ORB Dynamic Reentry V4 - Visual Indicator", overlay = true,
+     max_labels_count = 500, max_lines_count = 200)
+
+// Visual-only conversion of V4. It never submits or simulates orders and has no
+// LLM, bridge, OpenAI, FMP, broker, or webhook dependency.
+
+int ST_NEUTRAL = 0
+int ST_RETEST = 1
+int ST_WAIT_INSIDE = 2
+int ST_ACTIVE = 3
+int ST_FINISHED = 4
+
+// ───────────────────────────── Inputs ─────────────────────────────
+string orbTimezoneChoice = input.string("America/New_York", "OR time zone",
+     options = ["America/New_York", "Etc/UTC", "Europe/London", "Asia/Tokyo", "Australia/Sydney", "Exchange"],
+     group = "Opening range")
+int orbStartHour = input.int(9, "OR start hour", minval = 0, maxval = 23,
+     group = "Opening range", tooltip = "Hour in the selected OR time zone. Use 0 with minute 0 for midnight.")
+int orbStartMinute = input.int(30, "OR start minute", minval = 0, maxval = 55,
+     step = 5, group = "Opening range")
+string orbTimezone = orbTimezoneChoice == "Exchange" ? syminfo.timezone : orbTimezoneChoice
+int orbStartMinutes = orbStartHour * 60 + orbStartMinute
+int orbDurationMinutes = 15
+
+int atrPeriod = input.int(14, "15-minute ATR period", minval = 2, maxval = 100, group = "Dynamic route")
+float bufferMultiplier = input.float(0.20, "ATR buffer multiplier", minval = 0.01,
+     maxval = 2.0, step = 0.01, group = "Dynamic route")
+int minimumBufferTicks = input.int(1, "Minimum buffer ticks", minval = 1,
+     maxval = 100, group = "Dynamic route")
+int minimumStopTicks = input.int(2, "Minimum stop distance (ticks)", minval = 1,
+     maxval = 1000, group = "Dynamic route")
+int retestTtlBars = input.int(6, "Retest TTL (5-minute bars)", minval = 1,
+     maxval = 100, group = "Dynamic route")
+int insideBarsRequired = input.int(1, "Inside-OR closes to rearm", minval = 1,
+     maxval = 3, group = "Dynamic route")
+int maximumCycles = input.int(10, "Maximum cycles per day", minval = 1,
+     maxval = 20, group = "Dynamic route")
+float rewardMultiple = input.float(2.0, "Reward multiple", minval = 1.0,
+     maxval = 10.0, step = 0.25, group = "Dynamic route")
+string sameBarRule = input.string("Stop first", "If stop and target touch on same 5-minute bar",
+     options = ["Stop first", "Target first"], group = "Dynamic route")
+
+bool showOrMidpoint = input.bool(true, "Show OR midpoint", group = "Chart")
+bool showOrFill = input.bool(true, "Shade OR", group = "Chart")
+bool showAtrBuffer = input.bool(true, "Show ATR route buffer", group = "Chart")
+bool showMarketStructure = input.bool(true, "Show 1-minute market structure", group = "Chart")
+int pivotStrength = input.int(2, "Market-structure pivot strength", minval = 1,
+     maxval = 10, group = "Chart")
+bool showStatusTable = input.bool(true, "Show status table", group = "Chart")
+
+bool showArmedMarkers = input.bool(true, "Show armed markers", group = "Trade-plan display")
+bool showEntryMarkers = input.bool(true, "Show entry after armed", group = "Trade-plan display")
+bool showExitMarkers = input.bool(true, "Show exit after entry", group = "Trade-plan display")
+bool showPlanLevels = input.bool(true, "Show entry / stop / target levels", group = "Trade-plan display")
+
+// ───────────────────────────── Helpers ─────────────────────────────
+roundToTick(float value) =>
+    math.round(value / syminfo.mintick) * syminfo.mintick
+
+dayKey() =>
+    int shiftedTime = time - orbStartMinutes * 60 * 1000
+    year(shiftedTime, orbTimezone) * 10000 + month(shiftedTime, orbTimezone) * 100 + dayofmonth(shiftedTime, orbTimezone)
+
+clockMinutes(int timestamp) =>
+    hour(timestamp, orbTimezone) * 60 + minute(timestamp, orbTimezone)
+
+twoDigits(int value) =>
+    value < 10 ? "0" + str.tostring(value) : str.tostring(value)
+
+minutesFromOrStart(int timestamp) =>
+    int elapsed = clockMinutes(timestamp) - orbStartMinutes
+    elapsed < 0 ? elapsed + 24 * 60 : elapsed
+
+inOpeningRange(int timestamp) =>
+    int elapsed = minutesFromOrStart(timestamp)
+    elapsed >= 0 and elapsed < orbDurationMinutes
+
+// Exact OR engine, always evaluated from one-minute source bars regardless of
+// whether the chart is currently 1, 5, or 15 minutes.
+orEngine() =>
+    var int activeDay = na
+    var float rangeHigh = na
+    var float rangeLow = na
+    var int rangeCount = 0
+    var bool complete = false
+    int today = dayKey()
+    if na(activeDay) or today != activeDay
+        activeDay := today
+        rangeHigh := na
+        rangeLow := na
+        rangeCount := 0
+        complete := false
+    bool inRange = inOpeningRange(time)
+    if inRange
+        rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+        rangeLow := na(rangeLow) ? low : math.min(rangeLow, low)
+        rangeCount += 1
+    if not inRange and inRange[1]
+        complete := rangeCount == 15
+    [rangeCount > 0 ? rangeHigh : na, rangeCount > 0 ? rangeLow : na, complete, rangeCount]
+
+[orHigh, orLow, orComplete, orMinuteCount] = request.security(syminfo.tickerid, "1", orEngine(),
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+bool orAvailable = orMinuteCount > 0 and not na(orHigh) and not na(orLow)
+float orMidpoint = orAvailable ? roundToTick((orHigh + orLow) / 2.0) : na
+
+// Confirmed one-minute structure engine. Event counters persist so the latest
+// confirmed pivot remains detectable after switching among supported timeframes.
+structureEngine() =>
+    var int activeDay = na
+    var float priorHigh = na
+    var float priorLow = na
+    var int highEvent = 0
+    var int lowEvent = 0
+    var int highType = 0  // 1=H, 2=HH, 3=LH
+    var int lowType = 0   // 1=L, 2=HL, 3=LL
+    var float highPrice = na
+    var float lowPrice = na
+    int today = dayKey()
+    if na(activeDay) or today != activeDay
+        activeDay := today
+        priorHigh := na
+        priorLow := na
+        highEvent := 0
+        lowEvent := 0
+        highType := 0
+        lowType := 0
+        highPrice := na
+        lowPrice := na
+    float ph = ta.pivothigh(high, pivotStrength, pivotStrength)
+    float pl = ta.pivotlow(low, pivotStrength, pivotStrength)
+    bool afterOr = minutesFromOrStart(time[pivotStrength]) >= orbDurationMinutes
+    if afterOr and not na(ph)
+        highType := na(priorHigh) ? 1 : ph > priorHigh ? 2 : 3
+        highPrice := ph
+        priorHigh := ph
+        highEvent += 1
+    if afterOr and not na(pl)
+        lowType := na(priorLow) ? 1 : pl > priorLow ? 2 : 3
+        lowPrice := pl
+        priorLow := pl
+        lowEvent += 1
+    [highEvent, highType, highPrice, lowEvent, lowType, lowPrice]
+
+[structureHighEvent, structureHighType, structureHighPrice,
+ structureLowEvent, structureLowType, structureLowPrice] = request.security(
+     syminfo.tickerid, "1", structureEngine(), gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off)
+
+// Five-minute deterministic visual-plan engine. It emits monotonically
+// increasing event IDs so armed, entry, and exit events remain visible on a
+// 15-minute chart even though the decisions originate on five-minute closes.
+planEngine() =>
+    var int activeDay = na
+    var int state = ST_NEUTRAL
+    var int cycle = 1
+    var int insideCount = 0
+    var int retestAge = 0
+    var int direction = 0
+    var bool completedPlanToday = false
+    var float rangeHigh = na
+    var float rangeLow = na
+    var int rangeBars = 0
+    var bool complete = false
+    var float frozenAtr = na
+    var float routeBuffer = na
+    var float planEntry = na
+    var float planStop = na
+    var float planTarget = na
+    var int armedEvent = 0
+    var int entryEvent = 0
+    var int exitEvent = 0
+    var float exitPrice = na
+    var int exitReason = 0  // 1=target, 2=stop, 3=15:55 flatten
+    int today = dayKey()
+    if na(activeDay) or today != activeDay
+        activeDay := today
+        state := ST_NEUTRAL
+        cycle := 1
+        insideCount := 0
+        retestAge := 0
+        direction := 0
+        completedPlanToday := false
+        rangeHigh := na
+        rangeLow := na
+        rangeBars := 0
+        complete := false
+        frozenAtr := na
+        routeBuffer := na
+        planEntry := na
+        planStop := na
+        planTarget := na
+        exitPrice := na
+        exitReason := 0
+    bool inRange = inOpeningRange(time)
+    if inRange
+        rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+        rangeLow := na(rangeLow) ? low : math.min(rangeLow, low)
+        rangeBars += 1
+    float atr15 = request.security(syminfo.tickerid, "15", ta.atr(atrPeriod),
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+    if not inRange and inRange[1]
+        complete := rangeBars == 3
+        frozenAtr := atr15
+        routeBuffer := math.max(math.floor(frozenAtr * bufferMultiplier / syminfo.mintick) * syminfo.mintick,
+             minimumBufferTicks * syminfo.mintick)
+
+    int closeClock = clockMinutes(time_close)
+    bool operationWindow = minutesFromOrStart(time_close) > orbDurationMinutes and closeClock < 15 * 60 + 55
+    bool inside = complete and close > rangeLow and close < rangeHigh
+
+    if complete and closeClock >= 15 * 60 + 55 and closeClock < 18 * 60 and state == ST_ACTIVE
+        exitEvent += 1
+        exitPrice := close
+        exitReason := 3
+        state := ST_FINISHED
+        completedPlanToday := true
+
+    if state == ST_ACTIVE
+        bool stopTouched = direction == 1 ? low <= planStop : high >= planStop
+        bool targetTouched = direction == 1 ? high >= planTarget : low <= planTarget
+        if stopTouched or targetTouched
+            bool useStop = stopTouched and (not targetTouched or sameBarRule == "Stop first")
+            exitPrice := useStop ? planStop : planTarget
+            exitReason := useStop ? 2 : 1
+            exitEvent += 1
+            state := ST_FINISHED
+            completedPlanToday := true
+
+    if complete and operationWindow and not completedPlanToday
+        if state == ST_RETEST
+            retestAge += 1
+            bool entryTouched = direction == 1 ? low <= planEntry : high >= planEntry
+            bool oppositeBreak = direction == 1 ? close < rangeLow : close > rangeHigh
+            if entryTouched
+                entryEvent += 1
+                state := ST_ACTIVE
+            else if oppositeBreak or inside or retestAge >= retestTtlBars
+                state := ST_WAIT_INSIDE
+                insideCount := inside ? 1 : 0
+        else if state == ST_WAIT_INSIDE
+            insideCount := inside ? insideCount + 1 : 0
+            if insideCount >= insideBarsRequired and cycle < maximumCycles
+                cycle += 1
+                state := ST_NEUTRAL
+                insideCount := 0
+
+        if state == ST_NEUTRAL and cycle <= maximumCycles
+            int candidateDirection = close > rangeHigh ? 1 : close < rangeLow ? -1 : 0
+            if candidateDirection != 0
+                float boundary = candidateDirection == 1 ? rangeHigh : rangeLow
+                float distance = math.abs(close - boundary)
+                bool immediate = distance <= routeBuffer + syminfo.mintick / 100.0
+                float candidateEntry = roundToTick(immediate ? close : boundary)
+                float candidateStop = immediate
+                     ? roundToTick(candidateDirection == 1 ? rangeHigh - syminfo.mintick : rangeLow + syminfo.mintick)
+                     : roundToTick(candidateDirection == 1
+                         ? math.min(low, rangeHigh - 2 * syminfo.mintick) - syminfo.mintick
+                         : math.max(high, rangeLow + 2 * syminfo.mintick) + syminfo.mintick)
+                float risk = candidateDirection == 1 ? candidateEntry - candidateStop : candidateStop - candidateEntry
+                if risk >= minimumStopTicks * syminfo.mintick
+                    direction := candidateDirection
+                    planEntry := candidateEntry
+                    planStop := candidateStop
+                    planTarget := roundToTick(candidateDirection == 1
+                         ? candidateEntry + rewardMultiple * risk
+                         : candidateEntry - rewardMultiple * risk)
+                    armedEvent += 1
+                    retestAge := 0
+                    if immediate
+                        entryEvent += 1
+                        state := ST_ACTIVE
+                    else
+                        state := ST_RETEST
+                else
+                    state := ST_WAIT_INSIDE
+                    insideCount := 0
+    [rangeHigh, rangeLow, complete, frozenAtr, routeBuffer, state, cycle,
+     direction, planEntry, planStop, planTarget, armedEvent, entryEvent,
+     exitEvent, exitPrice, exitReason]
+
+[engineOrHigh, engineOrLow, engineComplete, frozenAtr, dynamicBuffer,
+ planState, planCycle, planDirection, planEntry, planStop, planTarget,
+ armedEvent, entryEvent, exitEvent, exitPrice, exitReason] = request.security(
+     syminfo.tickerid, "5", planEngine(), gaps = barmerge.gaps_off,
+     lookahead = barmerge.lookahead_off)
+
+// ───────────────────────────── OR and structure drawings ─────────────────────────────
+orHighPlot = plot(orAvailable ? orHigh : na, "OR High", color = color.purple,
+     linewidth = 2, style = plot.style_linebr)
+orLowPlot = plot(orAvailable ? orLow : na, "OR Low", color = color.purple,
+     linewidth = 2, style = plot.style_linebr)
+plot(showOrMidpoint and orAvailable ? orMidpoint : na, "OR Midpoint",
+     color = color.yellow, linewidth = 2, style = plot.style_linebr)
+fill(orHighPlot, orLowPlot, color = showOrFill and orAvailable ? color.new(color.purple, 82) : na,
+     title = "OR Zone", fillgaps = false)
+plot(showAtrBuffer and engineComplete ? engineOrHigh + dynamicBuffer : na,
+     "Long ATR Buffer", color = color.new(color.orange, 15), style = plot.style_linebr)
+plot(showAtrBuffer and engineComplete ? engineOrLow - dynamicBuffer : na,
+     "Short ATR Buffer", color = color.new(color.orange, 15), style = plot.style_linebr)
+
+bool newStructureHigh = structureHighEvent > nz(structureHighEvent[1])
+bool newStructureLow = structureLowEvent > nz(structureLowEvent[1])
+if showMarketStructure and newStructureHigh
+    string highLabelText = structureHighType == 1 ? "H" : structureHighType == 2 ? "HH" : "LH"
+    color textColor = structureHighType == 2 ? color.lime : color.orange
+    label.new(bar_index, structureHighPrice + 2 * syminfo.mintick, highLabelText,
+         style = label.style_label_down, color = color.new(textColor, 75),
+         textcolor = textColor, size = size.tiny)
+if showMarketStructure and newStructureLow
+    string lowLabelText = structureLowType == 1 ? "L" : structureLowType == 2 ? "HL" : "LL"
+    color textColor = structureLowType == 2 ? color.lime : color.orange
+    label.new(bar_index, structureLowPrice - 2 * syminfo.mintick, lowLabelText,
+         style = label.style_label_up, color = color.new(textColor, 75),
+         textcolor = textColor, size = size.tiny)
+
+// ───────────────────────────── Optional armed / entry / exit display ─────────────────────────────
+bool newArmed = armedEvent > nz(armedEvent[1])
+bool newEntry = entryEvent > nz(entryEvent[1])
+bool newExit = exitEvent > nz(exitEvent[1])
+if showArmedMarkers and newArmed
+    label.new(bar_index, planDirection == 1 ? low : high,
+         "ARMED " + (planDirection == 1 ? "LONG" : "SHORT") +
+         "\nEntry " + str.tostring(planEntry, format.mintick) +
+         "\nSL " + str.tostring(planStop, format.mintick) +
+         " | TP " + str.tostring(planTarget, format.mintick),
+         style = planDirection == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(color.aqua, 20), textcolor = color.black, size = size.small)
+if showEntryMarkers and newEntry
+    label.new(bar_index, planEntry, "ENTRY " + (planDirection == 1 ? "LONG" : "SHORT"),
+         style = planDirection == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(planDirection == 1 ? color.lime : color.red, 10),
+         textcolor = color.white, size = size.small)
+if showExitMarkers and newExit
+    string exitText = exitReason == 1 ? "TARGET EXIT" : exitReason == 2 ? "STOP EXIT" : "15:55 EXIT"
+    label.new(bar_index, exitPrice, exitText,
+         style = label.style_label_left, color = exitReason == 1 ? color.green : color.red,
+         textcolor = color.white, size = size.small)
+
+bool planVisible = showPlanLevels and (planState == ST_RETEST or planState == ST_ACTIVE)
+plot(planVisible ? planEntry : na, "Planned Entry", color = color.aqua,
+     linewidth = 1, style = plot.style_linebr)
+plot(planVisible ? planStop : na, "Planned Stop", color = color.red,
+     linewidth = 2, style = plot.style_linebr)
+plot(planVisible ? planTarget : na, "Planned Target", color = color.lime,
+     linewidth = 2, style = plot.style_linebr)
+
+alertcondition(newArmed, "ORB V4 armed", "ORB V4 deterministic plan armed on {{ticker}}")
+alertcondition(newEntry, "ORB V4 visual entry", "ORB V4 visual entry on {{ticker}}")
+alertcondition(newExit, "ORB V4 visual exit", "ORB V4 visual exit on {{ticker}}")
+
+// ───────────────────────────── Status ─────────────────────────────
+int orbEndMinutes = (orbStartMinutes + orbDurationMinutes) % (24 * 60)
+string orbScheduleText = twoDigits(orbStartHour) + ":" + twoDigits(orbStartMinute) + "-" +
+     twoDigits(int(math.floor(orbEndMinutes / 60))) + ":" + twoDigits(orbEndMinutes % 60) +
+     " " + orbTimezoneChoice
+var table status = table.new(position.top_right, 2, 9, border_width = 1)
+string stateText = planState == ST_NEUTRAL ? "Neutral" : planState == ST_RETEST ? "Retest armed" :
+     planState == ST_WAIT_INSIDE ? "Waiting inside close" : planState == ST_ACTIVE ? "Visual plan active" : "Finished"
+if barstate.islast and showStatusTable
+    table.cell(status, 0, 0, "ORB V4", bgcolor = color.purple, text_color = color.white)
+    table.cell(status, 1, 0, "INDICATOR ONLY", bgcolor = color.new(color.blue, 30), text_color = color.white)
+    table.cell(status, 0, 1, "Chart timeframe")
+    table.cell(status, 1, 1, timeframe.period)
+    table.cell(status, 0, 2, "OR schedule")
+    table.cell(status, 1, 2, orbScheduleText)
+    table.cell(status, 0, 3, "OR")
+    table.cell(status, 1, 3, orAvailable ? str.tostring(orLow, format.mintick) + " - " + str.tostring(orHigh, format.mintick) + (orComplete ? "" : " (building)") : "Waiting")
+    table.cell(status, 0, 4, "Midpoint")
+    table.cell(status, 1, 4, orAvailable ? str.tostring(orMidpoint, format.mintick) : "-")
+    table.cell(status, 0, 5, "ATR / buffer")
+    table.cell(status, 1, 5, str.tostring(frozenAtr, format.mintick) + " / " + str.tostring(dynamicBuffer, format.mintick))
+    table.cell(status, 0, 6, "State")
+    table.cell(status, 1, 6, stateText)
+    table.cell(status, 0, 7, "Cycle")
+    table.cell(status, 1, 7, str.tostring(planCycle) + " / " + str.tostring(maximumCycles))
+    table.cell(status, 0, 8, "Orders")
+    table.cell(status, 1, 8, "Never submitted")
+
+bool supportedChartTimeframe = timeframe.isminutes and
+     (timeframe.multiplier == 1 or timeframe.multiplier == 5 or timeframe.multiplier == 15)
+if barstate.isfirst and not supportedChartTimeframe
+    runtime.error("Use this ORB indicator on a 1, 5, or 15-minute chart.")
